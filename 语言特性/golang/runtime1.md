@@ -1,5 +1,10 @@
 # GO语言Runtime解析
 
+## Go语言Runtime的启动流程
+1. 调用osinit函数
+2. 调用schedinit函数
+3. 调用mstart函数
+
 ## GMP
 GMP模型是Go用来管理goroutine的方式，其中有三个概念，G是goroutine代表一个需要调度的任务，P代表一个goroutine的处理器，是M和G的中间层，提供M需要的上下文环境，调度G到M上去执行，M对应一个系统线程是真正工作的线程。他们之间的关系是M对应一个P，P中有一个G的队列，P会取出队列中的G，把G放到M上去执行。
 
@@ -10,8 +15,10 @@ GMP模型是Go用来管理goroutine的方式，其中有三个概念，G是gorou
 * sched：
 * g0：持有调度栈的goroutine。深度参与运行时调度，包括goroutine创建、大内存分配和CGO函数执行。
 
+## P
+
 ### P的创建
-P通过procresize函数进行初始化，P的初始化除了在sched进行初始化的时候进行，还在startTheWorldWithSema函数中被调用，这个函数和gc有关，涉及的gc阶段有gcStart，gcMarkDone，gcMarkTermination，startTheWorld。做这个操作的时候会获取sched.lock锁。
+P通过procresize函数进行初始化，P的初始化除了在调用schedinit函数中被调用，还在startTheWorldWithSema函数中被调用，这个函数和gc有关，涉及的gc阶段有gcStart，gcMarkDone，gcMarkTermination，startTheWorld。做这个操作的时候会获取sched.lock锁。
 
 
 这个函数具体做了以下一些事：
@@ -22,10 +29,12 @@ P通过procresize函数进行初始化，P的初始化除了在sched进行初始
 * 如果allp大了，截断allp
 * 设置除allp[0]以外的P设置为idle，加入到全局空闲队列
 
+## G
+
 ### G的创建
 创建一个goroutine时，会调用newproc函数创建G，将这个G放到当前正在运行的G所属的P的队列上面。创建G是通过newproc1函数来进行的，创建出G后通过runqput函数放到队列中，可能是全局队列也可能是P的本地队列。
 
-#### newproc1创建流程
+#### newproc1获取G流程
 1. 调用gfget函数，获取一个G。
     * gfget函数会看curP和sched上面有空闲G的话，就从curP或者sched的gFree上拿空闲的G。
     * 如果curP没有的话，就从sched的gFree上拿空闲的G放到curP上，直到curP有了32个空闲的G。
@@ -35,13 +44,51 @@ P通过procresize函数进行初始化，P的初始化除了在sched进行初始
     * 给G分配stack，把函数参数拷贝到这个G的栈上
 3. 最终拿到一个G后，调用memmove()把fn函数的参数拷贝到栈上。
 4. 设置G的一些参数，sp，pc等，把状态从Gdead改为Grunnable。
-总结创建流程就是，G的创建流程是首先从当前的P上拿空闲G，没有就看sched上有的话从sched上面拿空闲G，sched上面也没有的话，就创建一个新的G，然后把fn的变量拷贝到G的栈上，再去设置G的参数和sp，pc等，最后G的状态变为runnable。
+总结创建流程就是，G的创建流程是首先从当前的P上拿空闲G，没有就看sched上有的话从sched上面拿空闲G，sched上面也没有的话，就创建一个新的G，然后把fn的变量拷贝到G的栈上，再去设置G的参数和sp，pc，sched调度信息等等，最后G的状态变为runnable。
+
+**备注**
+1. 在newproc1的步骤4，会将G.sched.pc指向goexit()+PCQuantum，**应该是用于在goroutine被调度完成后执行的，还不确定**。
+2. goexit()是所有goroutine调用栈的栈顶，最后都会返回到这个函数里面。
+
 
 #### runqput放入队列流程
 通过调用newproc1拿到一个G之后呢这个G就是一个Grunnable状态的了，我们通过runqput把G放到队列上等待被P调度。流程如下：
 1. 通过newproc来创建的G在调用runqput的时候next=true，会放在P的next上面执行。
 2. 如果next上面有其他G的话，得把这个oldG扔到P的runq上去，如果runq满了，把这个oldG加上P的runq上的一批G，扔到全局队列里面去。
-总结下来，如果next=true，就会走扔到P的runnext的逻辑，如果next=false就只是扔到队列中，可能是P的本地队列，也可能是全局队列。
+总结一下就是，如果next=true，就会把G扔到P的runnext中，如果runnext有oldG，这个oldG会走next=false的逻辑。next=false的逻辑是把G扔到队列中，可能是P的本地队列，也可能是全局队列，由P的runq是否有空位来控制。
+
+#### G创建过程总结
+从上面的逻辑来总结一下创建goroutine的一个流程，首先通过go关键字创建goroutine会调用newproc函数，这个函数有两个主要逻辑，第一个逻辑是创建一个G，通过newproc1函数来获得一个G，这个G可能是从P的gFree或者sched的gFree中获取的，P和sched中是否有空余的gFree，优先拿P的，P中没有拿sched的。如果P和sched中都没有空闲的G，就会调用malg创建一个G。获取到一个G后需要把fn的参数替换到G的sp上，替换完成后会设置G的参数，sp，pc，status等。第二个逻辑是把拿到的G放到队列上，因为newproc调用runqput的时候next=true，所以会替换P上的老runnext，把旧的runnext扔到本地队列或全局队列里面等待调度。
+
+
+
+### G的调度
+G的调度是在schedule函数中执行的。在执行完schedinit函数进行初始化之后会执行mstart函数，这个函数中会调用到schedule函数，调用顺序为mstart -> mstart0 -> mstart1 -> schedule，schedule函数是一个不会退出的大循环，主要的作用就是查找runnable的G然后运行它。所以要解析G的调度，就要从这个函数下手。
+#### schedule执行流程
+1. 先机率取全局队列的G
+2. 没取全局取本地P的runq中的G
+3. 本地没有再调findrunnable拿一个G
+    * 从本地队列找
+    * 从全局队列找
+    * 从网络轮询器找
+    * 调runqsteal去其他P那里偷
+4. 拿到了就调execute执行，谁都没有G就阻塞等待
+    * 做一些工作，比如建立M和G的关系，改G的状态，改栈地址等等
+    * 调用gogo函数把goroutine放到当前线程上执行
+    * 执行完后进入goexit，做一些清除工作，然后把goroutine加入到P的gFree，最后重新调用schedule
+总结一下，G的调度是在schedule中进行的，shedule函数会找到一个runnable的G，然后执行它，查找的方式是首先有几率的从全局拿，没从全局拿或者全局没有，再去本地runq中拿，本地没有调用findrunnable函数，这个函数会先从本地拿，再从全局拿，再从netpoll拿，最后去其他P里面偷。
+
+#### 触发schedule的场景
+1. 主动挂起：gopark -> park_m -> schedule
+2. 系统调用：exitsyscall -> exitsyscall0 -> schedule
+3. 协作式调度：Gosched -> gosched_m -> goschedImpl -> schedule
+4. 系统监控：sysmon -> retake -> preemptone -> schedule
+5. 协程退出：goexit -> goexit0 -> schedule
+
+## M
+### M的创建
+运行时通过startm()来启动一个线程，该函数通过mge()来从sched.midle中获取M，如果没有的话通过newm()创建一个M并且和P进行绑定然后运行M，newm()中调用allocm()来创建一个M结构体并且和P绑定，然后调用newosproc来创建系统线程，并将M和系统线程进行绑定。
+
 
 ## 结构源码
 ```go 
