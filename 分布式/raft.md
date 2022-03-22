@@ -73,3 +73,13 @@ raft把各个节点分为leader，candidate，follower三种角色。
 
 ### 注意点
 1. 为了避免单个单个添加节点，
+
+
+# etcd
+## 架构
+分层：
+应用层
+raft层
+存储层
+
+
